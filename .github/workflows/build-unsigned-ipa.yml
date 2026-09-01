@@ -1,0 +1,147 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve Xcode container and scheme
+        id: resolve
+        env:
+          IOS_WORKSPACE: ${{ vars.IOS_WORKSPACE }}
+          IOS_PROJECT: ${{ vars.IOS_PROJECT }}
+          IOS_SCHEME: ${{ vars.IOS_SCHEME }}
+        run: |
+          set -euo pipefail
+
+          workspace="${IOS_WORKSPACE:-}"
+          project="${IOS_PROJECT:-}"
+          scheme="${IOS_SCHEME:-}"
+
+          if [[ -n "$workspace" ]]; then
+            if [[ ! -d "$workspace" ]]; then
+              echo "Configured workspace not found: $workspace" >&2
+              exit 1
+            fi
+            container_flag="-workspace"
+            container_path="$workspace"
+          elif [[ -n "$project" ]]; then
+            if [[ ! -d "$project" ]]; then
+              echo "Configured project not found: $project" >&2
+              exit 1
+            fi
+            container_flag="-project"
+            container_path="$project"
+          else
+            mapfile -d '' workspaces < <(find . -maxdepth 4 -type d -name "*.xcworkspace" -print0)
+            mapfile -d '' projects < <(find . -maxdepth 4 -type d -name "*.xcodeproj" -print0)
+
+            if [[ "${#workspaces[@]}" -eq 1 ]]; then
+              container_flag="-workspace"
+              container_path="${workspaces[0]#./}"
+            elif [[ "${#workspaces[@]}" -eq 0 && "${#projects[@]}" -eq 1 ]]; then
+              container_flag="-project"
+              container_path="${projects[0]#./}"
+            elif [[ "${#workspaces[@]}" -eq 0 && "${#projects[@]}" -eq 0 ]]; then
+              echo "No .xcworkspace or .xcodeproj found. Set IOS_WORKSPACE or IOS_PROJECT repository variable." >&2
+              exit 1
+            else
+              echo "Multiple Xcode containers found. Set IOS_WORKSPACE or IOS_PROJECT repository variable." >&2
+              exit 1
+            fi
+          fi
+
+          if [[ -z "$scheme" ]]; then
+            list_json="$RUNNER_TEMP/xcode-list.json"
+            xcodebuild "$container_flag" "$container_path" -list -json > "$list_json"
+            scheme="$(python3 - <<'PY' "$list_json"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+for root_key in ("workspace", "project"):
+    root = data.get(root_key, {})
+    schemes = root.get("schemes") or []
+    if schemes:
+        print(schemes[0])
+        break
+PY
+)"
+          fi
+
+          if [[ -z "$scheme" ]]; then
+            echo "Unable to resolve a build scheme. Set IOS_SCHEME repository variable." >&2
+            exit 1
+          fi
+
+          echo "container_flag=$container_flag" >> "$GITHUB_OUTPUT"
+          echo "container_path=$container_path" >> "$GITHUB_OUTPUT"
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+
+      - name: Build app for device (unsigned)
+        env:
+          CONTAINER_FLAG: ${{ steps.resolve.outputs.container_flag }}
+          CONTAINER_PATH: ${{ steps.resolve.outputs.container_path }}
+          SCHEME: ${{ steps.resolve.outputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            "$CONTAINER_FLAG" "$CONTAINER_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            clean build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned IPA
+        id: package
+        env:
+          SCHEME: ${{ steps.resolve.outputs.scheme }}
+        run: |
+          set -euo pipefail
+
+          products_path="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos"
+          app_path="$(find "$products_path" -maxdepth 1 -type d -name "*.app" | head -n 1 || true)"
+
+          if [[ -z "$app_path" ]]; then
+            echo "No .app product found in $products_path" >&2
+            exit 1
+          fi
+
+          payload_dir="$RUNNER_TEMP/Payload"
+          rm -rf "$payload_dir"
+          mkdir -p "$payload_dir"
+          cp -R "$app_path" "$payload_dir/"
+
+          safe_scheme="${SCHEME// /_}"
+          ipa_name="${safe_scheme}.ipa"
+          (cd "$RUNNER_TEMP" && /usr/bin/zip -qry "$ipa_name" Payload)
+
+          mkdir -p "$RUNNER_TEMP/unsigned-ipa-artifact"
+          mv "$RUNNER_TEMP/$ipa_name" "$RUNNER_TEMP/unsigned-ipa-artifact/"
+          echo "ipa_path=$RUNNER_TEMP/unsigned-ipa-artifact/$ipa_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: ${{ steps.package.outputs.ipa_path }}
+          if-no-files-found: error
